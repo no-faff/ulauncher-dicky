@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+non-repo-files/
+exports/
+CLAUDE.md
+HANDOFF.md

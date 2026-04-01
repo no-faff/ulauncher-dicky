@@ -1,0 +1,19 @@
+{
+  "required_api_version": "^2.0.0",
+  "name": "Dictionary",
+  "description": "Offline dictionary lookup using sdcv (StarDict). British English with Chambers Dictionary.",
+  "developer_name": "No Faff",
+  "icon": "images/icon.svg",
+  "options": {
+    "query_debounce": 0.15
+  },
+  "preferences": [
+    {
+      "id": "kw",
+      "type": "keyword",
+      "name": "Dictionary lookup",
+      "description": "Look up a word in the dictionary",
+      "default_value": "d"
+    }
+  ]
+}

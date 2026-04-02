@@ -53,7 +53,7 @@ Dicky works with any dictionary in [StarDict format](https://github.com/huzheng0
 
 #### Free dictionaries
 
-**GCIDE (GNU Collaborative International Dictionary of English)** - free, comprehensive English dictionary. Download the StarDict files from [dict.org mirrors](https://ftp.dict.org/pub/dict/).
+**GCIDE (GNU Collaborative International Dictionary of English)** - free, comprehensive English dictionary. Available from [gcide.gnu.org.ua](https://gcide.gnu.org.ua/).
 
 **Wiktionary exports** - community-maintained, regularly updated:
 

@@ -79,6 +79,8 @@ StarDict versions of well-known commercial dictionaries can be found online. Dic
 | French | Le Petit Robert, Collins Robert, Larousse |
 | German | Duden, Langenscheidt, PONS |
 
+Larger collections of StarDict dictionaries (including commercial ones) are available at community mirror sites. Search for "StarDict dictionary download" or "stardict bigdict".
+
 #### Where to put them
 
 Place dictionary files in `~/.stardict/dic/`. Each dictionary lives in its own subfolder containing `.ifo`, `.idx` and `.dict` (or `.dict.dz`) files.

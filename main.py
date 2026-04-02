@@ -15,7 +15,7 @@ from ulauncher.api.shared.action.SetUserQueryAction import SetUserQueryAction
 from ulauncher.api.shared.action.HideWindowAction import HideWindowAction
 
 ICON = "images/icon.svg"
-MAX_RESULTS = 8
+MAX_RESULTS = 10
 DESC_LEN = 200
 STARDICT_DIR = os.path.expanduser("~/.stardict/dic")
 
@@ -140,7 +140,7 @@ def extract_header(definition_text):
     return pronunciation, word_class
 
 
-def extract_definitions(definition_text, limit=5):
+def extract_definitions(definition_text, limit=7):
     """Pull numbered definitions from the text."""
     defs = []
     for line in definition_text.splitlines():
@@ -221,11 +221,19 @@ class QueryListener(EventListener):
             title = "  ".join(title_parts)
 
             if numbered_defs:
+                # Header row (word, pronunciation, class) with no definition
+                items.append(ExtensionResultItem(
+                    icon=ICON,
+                    name=title,
+                    description="",
+                    highlightable=False,
+                    on_enter=CopyToClipboardAction(defn.strip()),
+                ))
                 for i, d in enumerate(numbered_defs):
                     items.append(ExtensionResultItem(
                         icon=ICON,
-                        name=title if i == 0 else f"{i+1}. {d}",
-                        description=f"1. {d}" if i == 0 else "",
+                        name=f"{i+1}. {d}",
+                        description="",
                         highlightable=False,
                         on_enter=CopyToClipboardAction(d),
                     ))

@@ -5,6 +5,7 @@ import marshal
 import os
 import re
 import subprocess
+import threading
 from urllib.parse import quote
 
 from ulauncher.api.client.Extension import Extension
@@ -19,7 +20,7 @@ from ulauncher.api.shared.action.HideWindowAction import HideWindowAction
 from ulauncher.api.shared.action.ExtensionCustomAction import ExtensionCustomAction
 
 ICON = "images/icon.svg"
-MAX_RESULTS = 15
+MAX_RESULTS = 100
 DESC_LEN = 200
 STARDICT_DIR = os.path.expanduser("~/.stardict/dic")
 CONFIG_DIR = os.path.expanduser("~/.config/dicky")
@@ -124,9 +125,7 @@ def _idx_max_mtime(active_dict=None):
 
 
 def load_headwords(active_dict=None):
-    """Load headwords from .idx files, using a marshal cache for speed.
-    First load parses the binary .idx files (~36s for 8M words).
-    Subsequent loads read from cache (~2-3s)."""
+    """Load headwords from .idx files, using a marshal cache for speed."""
     cache = _cache_path(active_dict)
 
     # Try loading from cache
@@ -170,7 +169,11 @@ def load_headwords(active_dict=None):
 def parse_idx(idx_path):
     """Parse a StarDict .idx file and return headwords."""
     words = []
-    with open(idx_path, "rb") as f:
+    try:
+        f = open(idx_path, "rb")
+    except OSError:
+        return words
+    with f:
         data = f.read()
     i = 0
     try:
@@ -183,21 +186,24 @@ def parse_idx(idx_path):
     return words
 
 
-def prefix_search(query, headwords, headwords_lower, max_results=20):
-    """Find headwords starting with query using bisect on sorted lowercase list."""
+def prefix_search(query, headwords, headwords_lower, max_results=30):
+    """Find headwords starting with query using bisect on sorted lowercase list.
+    Results sorted by word length so shorter/commoner words appear first."""
     prefix = query.lower()
     if not prefix:
         return []
     start = bisect.bisect_left(headwords_lower, prefix)
-    results = []
+    # Gather more candidates than needed, then sort by length
+    candidates = []
     for i in range(start, len(headwords_lower)):
         if headwords_lower[i].startswith(prefix):
-            results.append(headwords[i])
-            if len(results) >= max_results:
+            candidates.append(headwords[i])
+            if len(candidates) >= max_results * 10:
                 break
         else:
             break
-    return results
+    candidates.sort(key=lambda w: len(w))
+    return candidates[:max_results]
 
 
 def find_near_misses(word, word_set):
@@ -218,38 +224,41 @@ def find_near_misses(word, word_set):
     return [c for c in candidates if c in word_set]
 
 
+def _run_sdcv(cmd):
+    """Run sdcv and return stdout, handling encoding errors gracefully."""
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.decode("utf-8", errors="replace")
+
+
 def sdcv_json(word, active_dict=None):
     """Fetch definition for a word via sdcv (case-insensitive exact match)."""
     base_cmd = ["sdcv", "-n", "-j", "--utf8-output"]
     if active_dict:
         base_cmd += ["-u", active_dict]
-    try:
-        result = subprocess.run(
-            base_cmd + ["-e", word],
-            capture_output=True, text=True, timeout=5,
-        )
-    except FileNotFoundError:
+    stdout = _run_sdcv(base_cmd + ["-e", word])
+    if stdout is None:
         return None
     entries = []
     try:
-        if result.stdout.strip():
-            entries = json.loads(result.stdout)
+        if stdout.strip():
+            entries = json.loads(stdout)
     except json.JSONDecodeError:
         pass
     if entries:
         return entries
     # sdcv -e is case-sensitive; retry without -e and filter
-    try:
-        result = subprocess.run(
-            base_cmd + [word],
-            capture_output=True, text=True, timeout=5,
-        )
-    except FileNotFoundError:
+    stdout = _run_sdcv(base_cmd + [word])
+    if stdout is None:
         return None
-    if not result.stdout.strip():
+    if not stdout.strip():
         return []
     try:
-        entries = json.loads(result.stdout)
+        entries = json.loads(stdout)
     except json.JSONDecodeError:
         return []
     return [e for e in entries if e.get("word", "").lower() == word.lower()]
@@ -272,6 +281,19 @@ _GCIDE_ACCENTS = {
         'a': 'ā', 'e': 'ē', 'i': 'ī', 'o': 'ō', 'u': 'ū',
         'A': 'Ā', 'E': 'Ē', 'I': 'Ī', 'O': 'Ō', 'U': 'Ū',
     },
+    "'": {  # acute
+        'a': 'á', 'e': 'é', 'i': 'í', 'o': 'ó', 'u': 'ú',
+        'A': 'Á', 'E': 'É', 'I': 'Í', 'O': 'Ó', 'U': 'Ú',
+    },
+}
+
+# GCIDE named entities
+_GCIDE_ENTITIES = {
+    'eth': 'ð', 'ETH': 'Ð', 'thorn': 'þ', 'THORN': 'Þ',
+    'ae': 'æ', 'AE': 'Æ', 'oe': 'œ', 'OE': 'Œ',
+    'root': '√', 'times': '×', 'divide': '÷',
+    'deg': '°', 'sect': '§', 'para': '¶',
+    'aum': 'ä',
 }
 
 
@@ -280,45 +302,89 @@ def _gcide_accent_replace(m):
     return _GCIDE_ACCENTS.get(mod, {}).get(char, char)
 
 
+def _gcide_accent_replace_rev(m):
+    """Handle reversed order: [o^] as well as [^o]."""
+    char, mod = m.group(1), m.group(2)
+    return _GCIDE_ACCENTS.get(mod, {}).get(char, char)
+
+
+def _gcide_entity_replace(m):
+    return _GCIDE_ENTITIES.get(m.group(1), m.group(0))
+
+
 def clean_definition(text):
     """Strip wav filenames, UK/US audio labels, metadata, markup and examples."""
-    # GCIDE accent markup: ["o] -> ö, [^e] -> ê, etc.
-    text = re.sub(r'\[(["^~=])([a-zA-Z])\]', _gcide_accent_replace, text)
+    # Replace non-breaking spaces with regular spaces (before other processing)
+    text = text.replace("\xa0", " ")
+    # HTML entities
+    text = text.replace("&quot;", '"').replace("&amp;", "&")
+    text = text.replace("&lt;", "<").replace("&gt;", ">")
+    # GCIDE accent markup: ["o] -> ö, [^e] -> ê, ['i] -> í, etc.
+    text = re.sub(r'\[(["\'^~=])([a-zA-Z])\]', _gcide_accent_replace, text)
+    # GCIDE reversed order: [o^] -> ô, [e^] -> ê, etc.
+    text = re.sub(r'\[([a-zA-Z])(["\'^~=])\]', _gcide_accent_replace_rev, text)
+    # GCIDE named entities: [eth] -> ð, [ae] -> æ, etc.
+    text = re.sub(r'\[([a-zA-Z]{2,5})\]', _gcide_entity_replace, text)
     # GCIDE cross-references: {Pisces} -> Pisces
     text = re.sub(r'\{([^}]+)\}', r'\1', text)
-    # GCIDE date/source markers: [1913 Webster], [PJC], etc.
-    text = re.sub(r'\[\d{4} Webster\]', '', text)
+    # GCIDE date/source markers and usage labels
+    text = re.sub(r'\[\d{4} Webster[^\]]*\]', '', text)
     text = re.sub(r'\[PJC\]', '', text)
+    text = re.sub(r'\[(?:Obs|R|Archaic|Rare|Colloq|Slang|Local|Cant)[^\]]*\]', '', text)
     # GCIDE backtick quotes: ``word'' -> "word"
     text = text.replace("``", "\u201c").replace("''", "\u201d")
-    # Cambridge grammar labels: wrap in brackets so they read as context
+    # Strip ALL HTML tags (Collins uses full HTML, Cambridge uses <E >, <I >)
+    text = re.sub(r"<[^>]+>", "", text)
+    # Strip leading partial HTML tag junk (truncated opening tags like: eight="15" ...>)
+    text = re.sub(r'^\s*\w+="[^"]*"[^>]*>', '', text, count=1)
+    # Wiktionary template markup
+    text = re.sub(r"\(senseid [^)]+\)", "", text)  # (senseid en Q8171)
+    text = re.sub(r"\(lb en ([^)]+)\)", r"(\1)", text)  # (lb en slang) -> (slang)
+    text = re.sub(r"\(m en ([^)]+)\)", r"\1", text)  # (m en word) -> word
+    text = re.sub(r"\{\{n-g\|([^}]+)\}\}", r"\1", text)  # {{n-g|text}} -> text
+    text = re.sub(r"\{\{[^}]*\}\}", "", text)  # remaining {{...}} templates
+    # Cambridge grammar labels: wrap in brackets
     text = re.sub(
         r"(countable or uncountable|countable|uncountable"
         r"|only singular|only plural|usually singular|usually plural"
         r"|not comparable)\s+",
         r"(\1) ", text
     )
-    # Concise Oxford: strip ■ markers and ↘ sub-definition arrows
-    text = text.replace("\u25a0", "").replace("\u2198", "")
-    # Replace non-breaking spaces with regular spaces
-    text = text.replace("\xa0", " ")
-    # Strip <E > and similar markup tags
-    text = re.sub(r"<[A-Z][^>]*>", "", text)
+    # Marker characters used across various dictionaries
+    text = text.replace("\u25a0", "")   # ■ Concise Oxford POS marker
+    text = text.replace("\u25aa", "")   # ▪ OALD separator
+    text = text.replace("\u2198", "")   # ↘ Concise Oxford sub-def arrow
+    text = text.replace("\u25b6", "")   # ▶ Concise Oxford Thesaurus
+    text = text.replace("\u2666", "")   # ♦ Chambers Thesaurus
+    text = text.replace("\u2191", "")   # ↑ OALD/MW cross-reference arrow
     # Strip wav filenames and preceding UK/US labels
     text = re.sub(r"\s*(?:UK|US)\s+\S+\.wav", "", text)
-    # Catch any remaining wav references
     text = re.sub(r"\S+\.wav", "", text)
     lines = text.splitlines()
     cleaned = []
     for line in lines:
         stripped = line.strip()
-        # Skip metadata lines
-        if stripped.startswith("Thesaurus+:") or stripped.startswith("Derived:"):
+        # Skip metadata/section lines (various dictionaries)
+        if any(stripped.startswith(p) for p in (
+            "Thesaurus+:", "Derived:", "Idioms:", "See also:",
+            "Word Origin:", "Word Family:", "Synonyms:", "Antonyms:",
+            "Related Word:", "Contrasted words:", "Syn.", "Ant.",
+            "USAGE NOTE:", "Derived Word:", "Forms:", "compare ",
+        )):
             continue
         # Skip example sentences (bullet points)
         if stripped and stripped[0] in "\u2022\u2219*":
             continue
-        cleaned.append(line)
+        # Skip inflection lines (MW Thesaurus: "wells plural")
+        if re.match(r"^\w+\s+(?:plural|singular|past tense|present participle)\s*$", stripped):
+            continue
+        # Skip roman numeral section headers (MW Thesaurus: "II. adverb")
+        if re.match(r"^[IVX]+\.\s+(?:noun|verb|adjective|adverb)", stripped, re.I):
+            continue
+        # Strip non-printable characters (Collins has corrupted trailing bytes)
+        line = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffd]", "", line)
+        # Collapse multiple spaces into one
+        cleaned.append(re.sub(r"  +", " ", line))
     return "\n".join(cleaned)
 
 
@@ -350,15 +416,41 @@ def extract_header(definition_text):
     return pronunciation, word_class
 
 
+_LABEL_PATTERN = re.compile(
+    r"^((?:(?:UK|US|informal|formal|slang|literary|old use|legal"
+    r"|specialized|disapproving|humorous|offensive|taboo)\s+)+)"
+)
+
+
+_SINGLE_LABEL = re.compile(
+    r"(?:UK|US|informal|formal|slang|literary|old use|legal"
+    r"|specialized|disapproving|humorous|offensive|taboo)"
+)
+
+
+def _bracket_labels(text):
+    """Wrap leading Cambridge register/region labels in brackets."""
+    m = _LABEL_PATTERN.match(text)
+    if m:
+        labels = ", ".join(_SINGLE_LABEL.findall(m.group(1)))
+        text = f"({labels}) {text[m.end():]}"
+    return text
+
+
 def extract_definitions(definition_text, limit=7):
     """Pull definitions from the text. Tries numbered defs first,
     then falls back to unnumbered non-empty lines after the header."""
     lines = definition_text.splitlines()
     vote_pattern = re.compile(r"^\(\d+ up, \d+ down\)$")
     # Match "1. ..." or "1) ..." or "1》..." numbering styles
-    num_pattern = re.compile(r"^\s*(\d+)[.)\u300b]\s*(.+)")
+    num_pattern = re.compile(r"^\s*(\d+)[.)\u300b]\s*(.*)")
     # GCIDE markers: [1913 Webster], [PJC], [Obs.], etc. - but not [with negative]
     marker_pattern = re.compile(r"^\s*\[\d{4}\s|^\s*\[PJC\]|^\s*\[Obs")
+
+    pos_label = re.compile(
+        r"^\s*(noun|verb|adjective|adverb|pronoun|preposition"
+        r"|conjunction|interjection)\s*$", re.I
+    )
 
     # Try numbered definitions first
     defs = []
@@ -368,23 +460,25 @@ def extract_definitions(definition_text, limit=7):
         match = num_pattern.match(lines[i])
         if match:
             text = match.group(2).strip()
-            # Urban Dictionary: vote count on numbered line, definition on next
-            if vote_pattern.match(text):
+            # Empty numbered line or vote count: definition is on the next line
+            if not text or vote_pattern.match(text):
+                found = False
                 for j in range(i + 1, len(lines)):
                     next_line = lines[j].strip()
-                    if next_line:
-                        text = next_line
-                        i = j
+                    if not next_line:
+                        continue
+                    # Skip if it's another numbered line
+                    if num_pattern.match(next_line):
                         break
-                else:
+                    text = next_line
+                    i = j
+                    found = True
+                    break
+                if not found:
                     i += 1
                     continue
             else:
                 # Collect indented continuation lines (GCIDE multi-line defs)
-                pos_label = re.compile(
-                    r"^\s*(noun|verb|adjective|adverb|pronoun|preposition"
-                    r"|conjunction|interjection)\s*$", re.I
-                )
                 j = i + 1
                 while j < len(lines):
                     cont = lines[j]
@@ -401,6 +495,8 @@ def extract_definitions(definition_text, limit=7):
                     text += " " + cont.strip()
                     j += 1
                 i = j
+            # Cambridge: wrap leading register/region labels
+            text = _bracket_labels(text)
             # Deduplicate (GCIDE sometimes repeats definitions)
             dedup_key = text[:60].lower()
             if dedup_key not in seen:
@@ -413,17 +509,35 @@ def extract_definitions(definition_text, limit=7):
     if defs:
         return defs
 
-    # No numbered defs - treat non-empty lines after the first as definitions.
+    # No numbered defs - join continuation lines into definitions.
     # Skip part-of-speech labels and roman numerals.
     skip = re.compile(
         r"^(n\.|v\.|adj\.|adv\.|prep\.|conj\.|pron\.|interj\."
         r"|I{1,3}V?|VI{0,3}|noun|verb|adjective|adverb)$"
     )
-    non_empty = [l.strip() for l in lines if l.strip()]
-    if len(non_empty) > 1:
-        result = [l for l in non_empty[1:] if not skip.match(l)]
-        return result[:limit]
-    return []
+    result = []
+    current = ""
+    # Find the first non-empty line (header) and skip it
+    first_content = 0
+    for idx, line in enumerate(lines):
+        if line.strip():
+            first_content = idx + 1
+            break
+    for line in lines[first_content:]:
+        stripped = line.strip()
+        if not stripped or marker_pattern.match(stripped):
+            if current and not skip.match(current):
+                result.append(current)
+                if len(result) >= limit:
+                    break
+            current = ""
+        elif current:
+            current += " " + stripped
+        else:
+            current = stripped
+    if current and not skip.match(current) and len(result) < limit:
+        result.append(current)
+    return result
 
 
 def extract_origin(definition_text):
@@ -465,6 +579,12 @@ def preview_definition(word, active_dict=None):
     if not entries:
         return ""
     defn = clean_definition(entries[0].get("definition", ""))
+    # Detect redirect entries (WordNet: bare base word on first line)
+    non_empty = [l.strip() for l in defn.splitlines() if l.strip()]
+    if non_empty and re.match(r"^[a-zA-Z]+$", non_empty[0]):
+        base = non_empty[0]
+        if base.lower() != word.lower():
+            return f"see: {base}"
     defs = extract_definitions(defn, limit=1)
     if defs:
         return defs[0][:DESC_LEN]
@@ -482,6 +602,7 @@ class DictionaryExtension(Extension):
         self.headwords_lower = []
         self.word_set = set()
         self._headwords_stale = True
+        self._load_lock = threading.Lock()
         self.auto_select_if_needed()
         self.subscribe(KeywordQueryEvent, QueryListener())
         self.subscribe(ItemEnterEvent, DictChooserListener())
@@ -543,10 +664,12 @@ class DictionaryExtension(Extension):
             active = (self.active_dict and
                       bookname.lower() == self.active_dict.lower())
             display_name = prettify_bookname(bookname)
-            slow_note = " (first search may be slow)" if wordcount > 1000000 else ""
+            slow_note = ""
+            if wordcount > 5000000:
+                slow_note = " (first search: wait a few seconds to build index; no delay after that)"
             if active:
                 name = f"\u2713 {display_name}"
-                desc = f"Active, {wordcount:,} words" if wordcount else "Active"
+                desc = f"Active, {wordcount:,} words{slow_note}" if wordcount else "Active"
             else:
                 name = display_name
                 desc = f"{wordcount:,} words{slow_note}" if wordcount else ""
@@ -561,7 +684,7 @@ class DictionaryExtension(Extension):
                 ),
             ))
 
-        return RenderResultListAction(items[:MAX_RESULTS])
+        return RenderResultListAction(items)
 
 
 class DictChooserListener(EventListener):
@@ -595,11 +718,13 @@ class QueryListener(EventListener):
             return extension.build_dict_list()
 
         # Load headwords if stale (deferred from dictionary switch)
-        if getattr(extension, '_headwords_stale', False):
-            extension.headwords = load_headwords(extension.active_dict)
-            extension.headwords_lower = [w.lower() for w in extension.headwords]
-            extension.word_set = {w.lower() for w in extension.headwords}
-            extension._headwords_stale = False
+        if extension._headwords_stale:
+            with extension._load_lock:
+                if extension._headwords_stale:
+                    extension.headwords = load_headwords(extension.active_dict)
+                    extension.headwords_lower = [w.lower() for w in extension.headwords]
+                    extension.word_set = {w.lower() for w in extension.headwords}
+                    extension._headwords_stale = False
 
         # Try exact match
         entries = sdcv_json(word, extension.active_dict)
@@ -745,7 +870,7 @@ class QueryListener(EventListener):
                 ExtensionResultItem(
                     icon=ICON,
                     name=f"No results for '{word}'",
-                    description="Word not found in any dictionary",
+                    description="Word not found",
                     on_enter=HideWindowAction(),
                 )
             ])

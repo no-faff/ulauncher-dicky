@@ -4,7 +4,9 @@ Offline dictionary for [Ulauncher](https://ulauncher.io/). Type `d word` and get
 
 Uses [sdcv](https://github.com/huzheng001/stardict-3) (StarDict console dictionary) for lookups.
 
-![Screenshot](screenshot.png)
+![Looking up "colour" in GCIDE](screenshot-gcide-colour.webp)
+![Looking up "color" in GCIDE](screenshot-gcide-color.webp)
+![Switching between dictionaries](screenshot-dictionaries.webp)
 
 ## Features
 
@@ -73,7 +75,7 @@ mv wikt-en-en-2025-10-05.ifo wikt-en-en-2025-10-05.idx wikt-en-en-2025-10-05.dic
 
 #### GCIDE
 
-The GNU Collaborative International Dictionary of English. Based on Webster's 1913, comprehensive and well-formatted. Available in StarDict format from the [stardict.uber.space archive](https://stardict.uber.space/bigdict/index.html) (look for `dictd_www.dict.org_gcide`). Download the `.tar.bz2` file and extract:
+The GNU Collaborative International Dictionary of English. Based on Webster's 1913, comprehensive and well-formatted. Available in StarDict format from the [stardict.uber.space archive](https://stardict.uber.space/dict.org/index.html). Download the `.tar.bz2` file and extract:
 
 ```bash
 tar -xjf stardict-dictd_www.dict.org_gcide-2.4.2.tar.bz2 -C ~/.stardict/dic/
@@ -118,7 +120,7 @@ Some archives extract into a subfolder automatically (`.tar.bz2` files usually d
 
 ### Multiple dictionaries
 
-Ulauncher shows a maximum of 15 results and has no scrolling. If you have several dictionaries installed, you can switch between them from within Ulauncher.
+If you have several dictionaries installed, you can switch between them from within Ulauncher.
 
 Type `d` with no word to see a list of all installed dictionaries. Select one to make it active.
 
